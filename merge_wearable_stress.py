@@ -228,7 +228,7 @@ V2_PHASE_MAP = [
 #   HR at 1 Hz        → keep first 1548 rows  (≈ 1548 s)
 #   IBI               → keep events with offset_s < 1548.25 s
 #
-# ⚠️  The HR/IBI cutoffs are approximate. Adjust S02_BVP_VALID_SECONDS
+# ⚠️ The HR/IBI cutoffs are approximate. Adjust S02_BVP_VALID_SECONDS
 #    if you have better information about the true duplication boundary.
 S02_BVP_VALID_SECONDS = 99088 / 64        # ≈ 1548.25 s — used for HR & IBI estimates
 
@@ -566,6 +566,9 @@ def _signals_to_wide(
     else:
         # f07: PPG sensor was physically blocked — BVP is meaningless
         bvp_32 = np.full(n, np.nan)
+        if not os.path.exists(bvp_path):
+            warnings.warn(f"{participant_id}: BVP.csv not found.")
+
 
     # ── 3.  EDA — upsample 4 Hz → 32 Hz via forward-fill ──────────────────
     eda_path = os.path.join(folder_path, "EDA.csv")
@@ -592,6 +595,8 @@ def _signals_to_wide(
     else:
         # f07: TEMP sensor was physically blocked
         temp_32 = np.full(n, np.nan)
+        if not os.path.exists(temp_path):
+            warnings.warn(f"{participant_id}: TEMP.csv not found.")
 
     # ── 5.  HR — upsample 1 Hz → 32 Hz via forward-fill ───────────────────
     hr_path = os.path.join(folder_path, "HR.csv")
@@ -611,6 +616,9 @@ def _signals_to_wide(
     else:
         # f07: HR is derived from the blocked PPG — physically invalid
         hr_32 = np.full(n, np.nan)
+        if not os.path.exists(hr_path):
+            warnings.warn(f"{participant_id}: HR.csv not found.")
+
 
     # ── 6.  IBI — forward-fill irregular events onto the 32 Hz grid ────────
     ibi_path = os.path.join(folder_path, "IBI.csv")
@@ -656,6 +664,9 @@ def _signals_to_wide(
     else:
         # f07: IBI is derived from the blocked PPG — physically invalid
         ibi_32 = np.full(n, np.nan)
+        if not os.path.exists(ibi_path):
+            warnings.warn(f"{participant_id}: IBI.csv not found.")
+
 
     # ── 7.  Assemble the wide 32 Hz DataFrame ───────────────────────────────
     return pd.DataFrame({
@@ -692,7 +703,7 @@ def process_participant(
     Returns
     -------
     pd.DataFrame with columns:
-        participant_id, trial, timestamp, phase,
+        participant_id, timestamp, phase,
         ACC_x, ACC_y, ACC_z, BVP, EDA, TEMP, HR, IBI
     """
     is_s02 = (participant_id == "S02")
@@ -713,7 +724,6 @@ def process_participant(
     boundaries    = build_phase_boundaries(session_start, tag_ts, phase_map)
 
     # ── Prepend metadata columns ─────────────────────────────────────────────
-    wide_df.insert(0, "trial",          trial)
     wide_df.insert(0, "participant_id", participant_id)
     wide_df.insert(3, "phase",          assign_phases(wide_df["timestamp"], boundaries))
 
@@ -763,7 +773,6 @@ def process_f14() -> pd.DataFrame:
     boundaries    = build_phase_boundaries(session_start, combined_tags, V2_PHASE_MAP)
 
     # Prepend metadata columns
-    wide_df.insert(0, "trial",          "v2")
     wide_df.insert(0, "participant_id", "f14")
     wide_df.insert(3, "phase",          assign_phases(wide_df["timestamp"], boundaries))
 

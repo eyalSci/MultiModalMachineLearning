@@ -42,10 +42,10 @@ OUTPUT
 Two DataFrames (df_v1, df_v2) in "wide" format at a uniform 32 Hz, with columns:
 
   participant_id  str            e.g. "S01", "f07"
-  trial           str            "v1" or "v2"
   timestamp       datetime64[ns] UTC time of each 32 Hz tick (from ACC grid)
   phase           str            protocol phase label at that timestamp (pd.NA outside
-                                 any defined phase interval)
+                                 any defined phase interval).  Repeated phase names
+                                 (Transition) are numbered: Transition_1, Transition_2, …
   ACC_x           float          accelerometer x-axis   (1/64 g)
   ACC_y           float          accelerometer y-axis   (1/64 g)
   ACC_z           float          accelerometer z-axis   (1/64 g)
@@ -81,8 +81,9 @@ f07  — Protection dock never removed from wristband; PPG and TEMP sensors
          were blocked.  Signals BVP, HR, IBI, and TEMP are set to NaN.
 
 f14  — Bluetooth connection lost mid-session; data split across two folders:
-         f14_a (Baseline) and f14_b (rest of protocol).
-         The two halves are concatenated chronologically into one "f14" record.
+         f14_a (Baseline only, no button presses) and f14_b (rest of protocol).
+         Only f14_b is used; it is renamed to "f14".  The Baseline data from
+         f14_a is discarded because it has no tags to anchor phase boundaries.
 
 USAGE
 -----
@@ -146,29 +147,29 @@ SIGNAL_UNITS = {
 #  ─────────────────────────────────────────────────────────────────────────────
 #  [0] → [1]        ~6 min               Pre-protocol  (sensor settling / setup)
 #  [1] → [2]        ~4 min               Baseline      (resting, eyes open)
-#  [2] → [3]        ~3 min               Transition    (pre-Stroop instructions)
+#  [2] → [3]        ~3 min               Transition_1  (pre-Stroop instructions)
 #  [3] → [4]        ~2 min               Stroop        (cognitive stress task)
 #  [4] → [5]        ~7 min               First Rest    (recovery)
 #  [5] → [6]        ~2 min               TMCT          (Trail Making / cognitive)
 #  [6] → [7]        ~5 min               Second Rest   (recovery)
 #  [7] → [8]        ~0.5 min             Real Opinion  (opinion elicitation)
-#  [8] → [9]        ~0.5 min             Transition    (brief prep)
+#  [8] → [9]        ~0.5 min             Transition_2  (brief prep)
 #  [9] → [10]       ~0.5 min             Opposite Opinion
-#  [10] → [11]      ~0.5 min             Transition    (brief prep)
+#  [10] → [11]      ~0.5 min             Transition_3  (brief prep)
 #  [11] → [12]      ~0.5 min             Subtract      (mental arithmetic)
 #  [12] → [13]      ~0.25 min            Post-protocol (session end marker)
 V1_PHASE_MAP = [
     ( 0,  1, "Pre-protocol"),
     ( 1,  2, "Baseline"),
-    ( 2,  3, "Transition"),
+    ( 2,  3, "Transition_1"),
     ( 3,  4, "Stroop"),
     ( 4,  5, "First Rest"),
     ( 5,  6, "TMCT"),
     ( 6,  7, "Second Rest"),
     ( 7,  8, "Real Opinion"),
-    ( 8,  9, "Transition"),
+    ( 8,  9, "Transition_2"),
     ( 9, 10, "Opposite Opinion"),
-    (10, 11, "Transition"),
+    (10, 11, "Transition_3"),
     (11, 12, "Subtract"),
     (12, 13, "Post-protocol"),
 ]
@@ -183,7 +184,7 @@ V1_PHASE_MAP = [
 #  [2] → [3]        ~7.5 min             TMCT
 #  [3] → [4]        ~14 min              First Rest
 #  [4] → [5]        ~0.5 min             Real Opinion
-#  [5] → [6]        ~0.35 min            Transition    (brief pause)
+#  [5] → [6]        ~0.35 min            Transition_1  (brief pause)
 #  [6] → [7]        ~0.5 min             Opposite Opinion
 #  [7] → [8]        ~19 min              Second Rest
 #  [8] → [9]        ~0.5 min             Subtract
@@ -193,7 +194,7 @@ V2_PHASE_MAP = [
     (2, 3, "TMCT"),
     (3, 4, "First Rest"),
     (4, 5, "Real Opinion"),
-    (5, 6, "Transition"),
+    (5, 6, "Transition_1"),
     (6, 7, "Opposite Opinion"),
     (7, 8, "Second Rest"),
     (8, 9, "Subtract"),
@@ -228,7 +229,7 @@ V2_PHASE_MAP = [
 #   HR at 1 Hz        → keep first 1548 rows  (≈ 1548 s)
 #   IBI               → keep events with offset_s < 1548.25 s
 #
-# ⚠️ The HR/IBI cutoffs are approximate. Adjust S02_BVP_VALID_SECONDS
+# ⚠️  The HR/IBI cutoffs are approximate. Adjust S02_BVP_VALID_SECONDS
 #    if you have better information about the true duplication boundary.
 S02_BVP_VALID_SECONDS = 99088 / 64        # ≈ 1548.25 s — used for HR & IBI estimates
 
@@ -682,6 +683,7 @@ def _signals_to_wide(
     })
 
 
+
 def process_participant(
     folder_path: str,
     participant_id: str,
@@ -698,7 +700,8 @@ def process_participant(
     ----------
     folder_path    : absolute path to the participant's data folder
     participant_id : e.g. "S01", "f07"
-    trial          : "v1" (S-participants) or "v2" (f-participants)
+    trial          : "v1" (S-participants) or "v2" (f-participants); used only
+                     to select the correct phase map — not stored as a column.
 
     Returns
     -------
@@ -723,9 +726,9 @@ def process_participant(
     tag_ts        = read_tags(folder_path)
     boundaries    = build_phase_boundaries(session_start, tag_ts, phase_map)
 
-    # ── Prepend metadata columns ─────────────────────────────────────────────
+    # ── Prepend metadata columns  ────────────────────────
     wide_df.insert(0, "participant_id", participant_id)
-    wide_df.insert(3, "phase",          assign_phases(wide_df["timestamp"], boundaries))
+    wide_df.insert(2, "phase",          assign_phases(wide_df["timestamp"], boundaries))
 
     return wide_df.reset_index(drop=True)
 
@@ -735,48 +738,34 @@ def process_f14() -> pd.DataFrame:
     Special case: participant f14 (v2 trial).
 
     The Bluetooth connection was lost mid-session:
-      - f14_a : contains the Baseline phase
-      - f14_b : contains the rest of the protocol
-
-    Strategy:
-      1. Build a wide 32 Hz DataFrame for f14_a and another for f14_b.
-      2. Concatenate them chronologically (timestamps are discontinuous at
-         the point of dropout, which is expected and preserved as-is).
-      3. Merge the tags from both sessions (sorted chronologically) and
-         use f14_a's session start for the phase boundary calculation.
-      4. Assign phase labels across the combined timeline.
-      5. Label the combined record as participant "f14".
+      - f14_a : Baseline only — no button presses, so phase boundaries cannot
+                be established from this half alone.  It is discarded.
+      - f14_b : Contains the rest of the protocol with all 9 button presses.
+                This is the only half used; it is relabelled as "f14".
 
     Returns
     -------
     pd.DataFrame — same schema as process_participant()
     """
-    folder_a = os.path.join(STRESS_DIR, "f14_a")
     folder_b = os.path.join(STRESS_DIR, "f14_b")
 
-    # Build wide DataFrames for each half independently
-    wide_a = _signals_to_wide(folder_a, "f14_a", is_s02=False, is_f07=False)
-    wide_b = _signals_to_wide(folder_b, "f14_b", is_s02=False, is_f07=False)
-
-    wide_df = pd.concat([wide_a, wide_b], ignore_index=True)
+    wide_df = _signals_to_wide(folder_b, "f14_b", is_s02=False, is_f07=False)
 
     if wide_df.empty:
-        warnings.warn("No data found for f14_a or f14_b.")
+        warnings.warn("No data found for f14_b.")
         return pd.DataFrame()
 
-    # Combine tags from both sessions sorted chronologically.
-    # Use f14_a's session start as tags[0] (the earliest recording start).
-    tags_a        = read_tags(folder_a)
-    tags_b        = read_tags(folder_b)
-    combined_tags = sorted(tags_a + tags_b)
-    session_start = _parse_start_time(os.path.join(folder_a, "EDA.csv"))
-    boundaries    = build_phase_boundaries(session_start, combined_tags, V2_PHASE_MAP)
+    # ── Phase boundaries from f14_b tags and its own session start ──────────
+    session_start = _parse_start_time(os.path.join(folder_b, "EDA.csv"))
+    tag_ts        = read_tags(folder_b)
+    boundaries    = build_phase_boundaries(session_start, tag_ts, V2_PHASE_MAP)
 
-    # Prepend metadata columns
+    # ── Prepend metadata columns ────────────────────────
     wide_df.insert(0, "participant_id", "f14")
-    wide_df.insert(3, "phase",          assign_phases(wide_df["timestamp"], boundaries))
+    wide_df.insert(2, "phase",          assign_phases(wide_df["timestamp"], boundaries))
 
     return wide_df.reset_index(drop=True)
+
 
 
 # ============================================================
@@ -828,6 +817,8 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame]:
     df_v2 : pd.DataFrame — trial v2 (participants f01–f18), wide 32 Hz format
 
     Both DataFrames share the same column schema (see module docstring).
+    No 'trial' column is included; v1 vs v2 membership is implicit in the
+    participant ID prefix (S = v1, f = v2).
     """
     print("=" * 60)
     print("Wearable Stress Dataset — Merge Script")
@@ -844,7 +835,7 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame]:
         if not os.path.isdir(full_path):
             continue
         if entry in ("f14_a", "f14_b"):
-            # f14 is handled as a merged special case — skip here
+            # f14 is handled as a special case — only f14_b is used, skip both here
             continue
         if entry.startswith("S"):
             v1_participants.append((full_path, entry))
@@ -855,14 +846,14 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame]:
     print(f"\nProcessing V1 ({len(v1_participants)} participants) …")
     df_v1 = build_trial_df("v1", v1_participants)
 
-    # ── V2 (f01–f18, including merged f14) ───────────────────────────────────
+    # ── V2 (f01–f18, including f14 from f14_b only) ───────────────────────────
     print(f"\nProcessing V2 ({len(v2_participants) + 1} participants, incl. f14) …")
     df_v2_base = build_trial_df("v2", v2_participants)
 
-    print("    [V2] Processing f14 (split session: f14_a + f14_b) …")
+    print("    [V2] Processing f14 (f14_b only) …")
     df_f14 = process_f14()
 
-    # Combine regular V2 participants with the reconstructed f14 record
+    # Combine regular V2 participants with the f14 record
     df_v2 = (
         pd.concat([df_v2_base, df_f14], ignore_index=True)
         .sort_values(["participant_id", "timestamp"])

@@ -55,6 +55,12 @@ Two DataFrames (df_v1, df_v2) in "wide" format at a uniform 32 Hz, with columns:
   TEMP            float          skin temperature       (°C; NaN for f07)
   HR              float          heart rate             (bpm; NaN for f07)
   IBI             float          inter-beat interval    (s; NaN for f07)
+  reported_stress float          self-reported stress score (0–10 scale) from
+                                 Stress_Level_v1/2.csv.  Placed at the last
+                                 timestamp of each non-Transition phase, then
+                                 propagated backward in 30-second steps while
+                                 the candidate timestamp is ≥ 30 s from the
+                                 phase start.  NaN everywhere else.
 
 RESAMPLING STRATEGY
 -------------------
@@ -843,6 +849,126 @@ def process_f14() -> pd.DataFrame:
 
 
 
+
+# ============================================================
+# STRESS SCORE LOADING & ASSIGNMENT
+# ============================================================
+
+def load_stress_levels(filepath: str) -> pd.DataFrame:
+    """
+    Load a Stress_Level_v*.csv file and return it in long format.
+
+    Raw file layout: one row per participant, one column per phase, values
+    are self-reported stress scores on a 0–10 scale.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        participant_id  str
+        phase           str   — matches the phase labels used in the DataFrame
+        reported_stress float
+    """
+    df = pd.read_csv(filepath, index_col=0, encoding="latin-1")
+    df.index.name = "participant_id"
+    df = df.reset_index()
+    melted = df.melt(
+        id_vars="participant_id",
+        var_name="phase",
+        value_name="reported_stress",
+    )
+    melted["participant_id"] = melted["participant_id"].str.strip()
+    return melted
+
+
+def assign_reported_stress(
+    df: pd.DataFrame,
+    stress_lut: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Add a 'reported_stress' column to a wide 32 Hz DataFrame.
+
+    Placement rule (applied per participant × phase, skipping Transition phases):
+
+      1. Always place the stress score at the very last timestamp of the phase.
+      2. Step backward in 30-second intervals: place the score at
+         last_ts − 30 s, last_ts − 60 s, … as long as the candidate
+         timestamp is still at least 30 seconds after the phase start.
+         (Rule: candidate_ts − phase_start ≥ 30 s)
+      3. All other rows in the phase remain NaN.
+
+    At 32 Hz, 30 seconds = exactly 960 rows.  Backward steps are therefore
+    taken as row-index offsets of 960 rather than floating-point timestamp
+    arithmetic, which avoids any sub-millisecond rounding issues.
+
+    Parameters
+    ----------
+    df         : merged wide DataFrame (all participants, one trial version)
+    stress_lut : long-format stress scores from load_stress_levels()
+
+    Returns
+    -------
+    pd.DataFrame — same as input with 'reported_stress' column appended.
+    NaN for Transition phases, for rows outside the placement grid, and for
+    any participant/phase pair not found in stress_lut.
+    """
+    STEP_ROWS   = 30 * 32          # 960 rows = 30 s at 32 Hz
+    MIN_SECS    = 30.0             # minimum seconds from phase start to place a score
+
+    # Initialise the column as all-NaN float
+    df = df.copy()
+    df["reported_stress"] = np.nan
+
+    # Build a fast lookup dict: (participant_id, phase) → score
+    score_map: dict[tuple, float] = {
+        (row.participant_id, row.phase): row.reported_stress
+        for row in stress_lut.itertuples(index=False)
+    }
+
+    # Process each (participant, phase) group independently
+    for (pid, phase), grp in df.groupby(
+        ["participant_id", "phase"], sort=False, observed=True
+    ):
+        # Skip Transition phases — no stress score is recorded for them
+        if isinstance(phase, str) and phase.startswith("Transition"):
+            continue
+
+        score = score_map.get((pid, phase))
+        if score is None or (isinstance(score, float) and np.isnan(score)):
+            # No score available for this participant/phase — leave as NaN
+            warnings.warn(f"Reported stress on stage {phase} for {pid} not found.")
+            continue
+
+        # Integer row positions within this group (0 = first row of phase)
+        n          = len(grp)
+        phase_start_ts = grp["timestamp"].iloc[0]
+
+        # Collect row positions (within grp) where the score will be placed.
+        # Position n-1 is always included (last timestamp of the phase).
+        positions = []
+        pos = n - 1                           # start at the last row
+        while pos >= 0:
+            ts = grp["timestamp"].iloc[pos]
+            secs_from_start = (ts - phase_start_ts).total_seconds()
+
+            if pos == n - 1:
+                # Last timestamp: always place regardless of phase duration
+                positions.append(pos)
+            elif secs_from_start >= MIN_SECS:
+                # Subsequent backward steps: only if ≥ 30 s from phase start
+                positions.append(pos)
+            else:
+                # Too close to the phase start — stop stepping backward
+                break
+
+            pos -= STEP_ROWS                  # step back 30 s (960 rows)
+
+        # Write the score into the main DataFrame at the resolved positions
+        target_indices = grp.index[positions]
+        df.loc[target_indices, "reported_stress"] = score
+
+    return df
+
+
 # ============================================================
 # MAIN ASSEMBLY
 # ============================================================
@@ -899,6 +1025,11 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame]:
     print("Wearable Stress Dataset — Merge Script")
     print("=" * 60)
 
+    # ── Load self-reported stress scores ─────────────────────────────────────
+    print("\nLoading stress level scores …")
+    sl_v1 = load_stress_levels(os.path.join(BASE_DIR, "Stress_Level_v1.csv"))
+    sl_v2 = load_stress_levels(os.path.join(BASE_DIR, "Stress_Level_v2.csv"))
+
     # ── Discover participant folders ──────────────────────────────────────────
     all_entries = sorted(os.listdir(STRESS_DIR))
 
@@ -934,6 +1065,11 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame]:
         .sort_values(["participant_id", "timestamp"])
         .reset_index(drop=True)
     )
+
+    # ── Assign self-reported stress scores ───────────────────────────────────
+    print("\nAssigning reported stress scores …")
+    df_v1 = assign_reported_stress(df_v1, sl_v1)
+    df_v2 = assign_reported_stress(df_v2, sl_v2)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     signal_cols = ["ACC_x", "ACC_y", "ACC_z", "BVP", "EDA", "TEMP", "HR", "IBI"]

@@ -907,9 +907,11 @@ def assign_reported_stress(
 
     Returns
     -------
-    pd.DataFrame — same as input with 'reported_stress' column appended.
-    NaN for Transition phases, for rows outside the placement grid, and for
-    any participant/phase pair not found in stress_lut.
+    pd.DataFrame — same as input with 'reported_stress' and 'weight' columns
+    appended.  'reported_stress' is NaN for Transition phases, for rows outside
+    the placement grid, and for any participant/phase pair not found in
+    stress_lut.  'weight' = 1 / (number of scored rows in that phase) at every
+    scored row, NaN elsewhere — ensures weights sum to 1.0 within each phase.
     """
     STEP_ROWS   = 30 * 32          # 960 rows = 30 s at 32 Hz
     MIN_SECS    = 30.0             # minimum seconds from phase start to place a score
@@ -965,6 +967,22 @@ def assign_reported_stress(
         # Write the score into the main DataFrame at the resolved positions
         target_indices = grp.index[positions]
         df.loc[target_indices, "reported_stress"] = score
+
+    # ── Assign weight column ─────────────────────────────────────────────────
+    # For each (participant, phase) group: weight = 1 / n_scored for every row
+    # that received a stress score, NaN everywhere else.
+    # This ensures that summing weights within a phase always equals 1,
+    # regardless of how many 30-second slots fit in that phase.
+    df["weight"] = np.nan
+    scored_mask = df["reported_stress"].notna()
+    if scored_mask.any():
+        # Count scored rows per (participant_id, phase) group
+        counts = (
+            df[scored_mask]
+            .groupby(["participant_id", "phase"], observed=True)
+            .transform("count")["reported_stress"]   # same index as df[scored_mask]
+        )
+        df.loc[scored_mask, "weight"] = 1.0 / counts
 
     return df
 

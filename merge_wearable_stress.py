@@ -43,10 +43,7 @@ Two DataFrames (df_v1, df_v2) in "wide" format at a uniform 32 Hz, with columns:
 
   participant_id  str            e.g. "S01", "f07"
   timestamp       datetime64[ns] UTC time of each 32 Hz tick (from ACC grid)
-  phase           str            protocol phase label. Pre-protocol, Post-protocol,
-                                 and trailing NaN rows (recording tail after the last
-                                 phase) are dropped.  Any unexpected mid-session NaN
-                                 rows emit a UserWarning and are also dropped.
+  phase           str            protocol phase label.
   ACC_x           float          accelerometer x-axis   (1/64 g)
   ACC_y           float          accelerometer y-axis   (1/64 g)
   ACC_z           float          accelerometer z-axis   (1/64 g)
@@ -631,7 +628,7 @@ def _signals_to_wide(
 
     # ── 6.  IBI — forward-fill irregular events onto the 32 Hz grid ────────
     ibi_path = os.path.join(folder_path, "IBI.csv")
-    if os.path.exists(ibi_path) and not is_f07 and is not is_s02:
+    if os.path.exists(ibi_path) and not is_f07 and not is_s02:
         ibi_df = read_ibi_signal(ibi_path)
 
         if not ibi_df.empty:
@@ -665,7 +662,7 @@ def _signals_to_wide(
             warnings.warn(f"{participant_id}: IBI.csv not found.")
         if is_s02:
             warnings.warn(
-                f"S02 IBI: session-start timestamp in IBI.csv start in 1959 instead of 2013 like the rest of the files. Setting IBI to NaN"
+                f"S02 IBI: session-start timestamp in IBI.csv start in year 1959 instead of year 2013 like the rest of the files. Setting IBI to NaN"
             )
 
 
@@ -685,27 +682,19 @@ def _signals_to_wide(
 
 
 
-# ── Phase trimming ─────────────────────────────────────────────────────────
+# ── Phase organize ─────────────────────────────────────────────────────────
 
-# Phases that exist solely as recording bookends and carry no experimental
-# content — dropped after phase assignment.
-BOOKEND_PHASES = {"Pre-protocol", "Post-protocol"}
-
-
-def _trim_phases(df: pd.DataFrame, participant_id: str) -> pd.DataFrame:
+def _organize_phases(df: pd.DataFrame, participant_id: str) -> pd.DataFrame:
     """
-    Remove bookend and NaN phase rows from a per-participant wide DataFrame.
+    ─────────── Set trailing tail NaN to "Post-protocol" and warn on mid-session NaN ───────────
+    
+    Two operations are applied in order:
 
-    Three operations are applied in order:
-
-    1. Drop bookend phases ("Pre-protocol", "Post-protocol").
-       These are recording artefacts, not experimental conditions.
-
-    2. Identify the trailing NaN block — all rows after the last row whose
+    1. Identify the trailing NaN block — all rows after the last row whose
        phase is not NaN.  This corresponds to the E4 continuing to record
-       after the final button press.  These rows are dropped silently.
+       after the final button press.  These rows are set to "Post-protocol" phase.
 
-    3. Check whether any NaN-phase rows remain after step 2 (i.e. mid-session
+    2. Check whether any NaN-phase rows remain after step 2 (i.e. mid-session
        gaps).  These are unexpected: a NaN in the middle of the protocol means
        a timestamp fell outside every defined phase boundary, which could
        indicate a missing tag or a phase-map alignment error.  A UserWarning
@@ -718,12 +707,10 @@ def _trim_phases(df: pd.DataFrame, participant_id: str) -> pd.DataFrame:
 
     Returns
     -------
-    pd.DataFrame with bookend and NaN rows removed, index reset.
+    pd.DataFrame with NaN rows set to "Post-protocol" or removed, index reset.
     """
-    # ── 1. Drop bookend phases ───────────────────────────────────────────────
-    df = df[~df["phase"].isin(BOOKEND_PHASES)].copy()
-
-    # ── 2. Drop trailing NaN tail ────────────────────────────────────────────
+    
+    # ── 1. Add trailing NaN tail to "Post-protocol" ────────────────────────────────────────────
     # Find the integer position of the last non-NaN phase row.
     valid_mask   = df["phase"].notna()
     if not valid_mask.any():
@@ -736,8 +723,7 @@ def _trim_phases(df: pd.DataFrame, participant_id: str) -> pd.DataFrame:
 
     last_valid_pos = valid_mask.values.nonzero()[0][-1]   # last True index
     # Rows strictly after the last valid phase are the trailing NaN tail
-    trailing_nan_count = len(df) - (last_valid_pos + 1)
-    df = df.iloc[: last_valid_pos + 1].copy()
+    df.loc[last_valid_pos + 1:, "phase"] = "Post-protocol"
 
     # ── 3. Warn about any remaining mid-session NaN rows ─────────────────────
     mid_nan_mask  = df["phase"].isna()
@@ -803,8 +789,8 @@ def process_participant(
     wide_df.insert(0, "participant_id", participant_id)
     wide_df.insert(2, "phase",          assign_phases(wide_df["timestamp"], boundaries))
 
-    # ── Drop trailing tail, bookend phases, and warn on mid-session NaN ──────
-    return _trim_phases(wide_df, participant_id)
+    # ── Set trailing tail NaN to "Post-protocol" and warn on mid-session NaN ──────
+    return _organize_phases(wide_df, participant_id)
 
 
 def process_f14() -> pd.DataFrame:
@@ -838,8 +824,8 @@ def process_f14() -> pd.DataFrame:
     wide_df.insert(0, "participant_id", "f14")
     wide_df.insert(2, "phase",          assign_phases(wide_df["timestamp"], boundaries))
 
-    # ── Drop trailing tail, bookend phases, and warn on mid-session NaN ──────
-    return _trim_phases(wide_df, "f14")
+    # ── Set trailing tail NaN to "Post-protocol" and warn on mid-session NaN ──────
+    return _organize_phases(wide_df, "f14")
 
 
 
@@ -926,6 +912,10 @@ def assign_reported_stress(
     ):
         # Skip Transition phases — no stress score is recorded for them
         if isinstance(phase, str) and phase.startswith("Transition"):
+            continue
+        
+        # Skip Pre-protocol and Post-protocol phases - no stress score is recorded for them
+        if isinstance(phase, str) and phase.endswith("protocol"):
             continue
 
         score = score_map.get((pid, phase))

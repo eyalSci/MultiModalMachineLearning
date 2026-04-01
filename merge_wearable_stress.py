@@ -205,6 +205,7 @@ V2_PHASE_MAP = [
     (6, 7, "Opposite Opinion"),
     (7, 8, "Second Rest"),
     (8, 9, "Subtract"),
+    (9, 10, "Post-protocol"),
 ]
 
 
@@ -630,22 +631,10 @@ def _signals_to_wide(
 
     # ── 6.  IBI — forward-fill irregular events onto the 32 Hz grid ────────
     ibi_path = os.path.join(folder_path, "IBI.csv")
-    if os.path.exists(ibi_path) and not is_f07:
+    if os.path.exists(ibi_path) and not is_f07 and is not is_s02:
         ibi_df = read_ibi_signal(ibi_path)
 
         if not ibi_df.empty:
-            # S02: drop IBI events beyond the estimated valid BVP duration
-            if is_s02:
-                ibi_start = _parse_start_time(ibi_path)
-                cutoff_dt = ibi_start + pd.Timedelta(seconds=S02_BVP_VALID_SECONDS)
-                before    = len(ibi_df)
-                ibi_df    = ibi_df[ibi_df["timestamp"] < cutoff_dt].copy()
-                warnings.warn(
-                    f"S02 IBI: kept {len(ibi_df)}/{before} events with timestamp < "
-                    f"session_start + {S02_BVP_VALID_SECONDS:.1f} s "
-                    "(estimated cutoff from BVP valid duration; see data_constraints.txt)."
-                )
-
             # Build a timestamp-indexed Series of IBI values, then reindex to
             # the 32 Hz grid using forward-fill.
             ibi_series = ibi_df.set_index("timestamp")["IBI"].sort_index()
@@ -674,6 +663,11 @@ def _signals_to_wide(
         ibi_32 = np.full(n, np.nan)
         if not os.path.exists(ibi_path):
             warnings.warn(f"{participant_id}: IBI.csv not found.")
+        if is_s02:
+            warnings.warn(
+                f"S02 IBI: session-start timestamp in IBI.csv start in 1959 instead of 2013 like the rest of the files. Setting IBI to NaN"
+            )
+
 
 
     # ── 7.  Assemble the wide 32 Hz DataFrame ───────────────────────────────

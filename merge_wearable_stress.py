@@ -628,42 +628,67 @@ def _signals_to_wide(
 
     # ── 6.  IBI — forward-fill irregular events onto the 32 Hz grid ────────
     ibi_path = os.path.join(folder_path, "IBI.csv")
-    if os.path.exists(ibi_path) and not is_f07 and not is_s02:
+    if os.path.exists(ibi_path) and not is_f07:
         ibi_df = read_ibi_signal(ibi_path)
 
-        if not ibi_df.empty:
-            # Build a timestamp-indexed Series of IBI values, then reindex to
-            # the 32 Hz grid using forward-fill.
-            ibi_series = ibi_df.set_index("timestamp")["IBI"].sort_index()
-            # Guard against duplicate timestamps in the IBI file (observed in S02
-            # after truncation): keep the last recorded value for any timestamp
-            # that appears more than once.
-            ibi_series = ibi_series[~ibi_series.index.duplicated(keep="last")]
-            grid_index = pd.DatetimeIndex(timestamps)
+        # S02 IBI timestamp mismatch check.
+        # S02's IBI.csv was downloaded with a different de-identification time-shift
+        # than all other signal files: its session-start lands in 1959 while EDA,
+        # ACC, BVP etc. are all in 2013. Because the IBI events are expressed as
+        # offsets from that wrong anchor, every beat timestamp is also in 1959 and
+        # will never fall within any phase boundary (which are anchored to EDA's
+        # 2013 start). The mismatch is detected by comparing IBI's session-start to
+        # EDA's session-start; a difference of more than 1 hour is treated as a
+        # misalignment and IBI is set to NaN with a warning.
+        if is_s02 and not ibi_df.empty:
+            ibi_start = _parse_start_time(ibi_path)
+            eda_start = _parse_start_time(os.path.join(folder_path, "EDA.csv"))
+            shift_hours = abs((ibi_start - eda_start).total_seconds()) / 3600
+            if shift_hours > 1:
+                warnings.warn(
+                    f"S02 IBI: session-start in IBI.csv ({ibi_start}) differs from "
+                    f"EDA.csv ({eda_start}) by {shift_hours:,.0f} hours. "
+                    "This is a known de-identification mismatch — IBI timestamps "
+                    "cannot be aligned with phase boundaries. Setting IBI to NaN."
+                )
+                ibi_32 = np.full(n, np.nan)
+            else:
+                # Timestamps aligned — apply normal S02 row truncation
+                cutoff_dt = ibi_start + pd.Timedelta(seconds=S02_BVP_VALID_SECONDS)
+                before    = len(ibi_df)
+                ibi_df    = ibi_df[ibi_df["timestamp"] < cutoff_dt].copy()
+                ibi_df    = ibi_df[~ibi_df["timestamp"].duplicated(keep="last")]
+                warnings.warn(
+                    f"S02 IBI: kept {len(ibi_df)}/{before} events < "
+                    f"session_start + {S02_BVP_VALID_SECONDS:.1f} s "
+                    "(estimated cutoff from BVP valid duration; see data_constraints.txt)."
+                )
+                ibi_df  # fall through to normal forward-fill below
 
-            # Union the event timestamps and the grid, forward-fill, then
-            # project back down to grid timestamps only.
-            ibi_reindexed = (
-                ibi_series
-                .reindex(ibi_series.index.union(grid_index))
-                .ffill()
-                .reindex(grid_index)
-            )
-            # Back-fill leading NaN: rows before the very first beat carry the
-            # first available IBI value rather than being left as NaN.
-            ibi_32 = ibi_reindexed.bfill().values.astype(float)
-        else:
-            # No beats detected in this session — cannot produce meaningful IBI
-            ibi_32 = np.full(n, np.nan)
+        if not is_s02 or (is_s02 and 'ibi_32' not in dir()):
+            # Normal forward-fill path (non-S02, or S02 with aligned timestamps)
+            if not ibi_df.empty:
+                ibi_series = ibi_df.set_index("timestamp")["IBI"].sort_index()
+                ibi_series = ibi_series[~ibi_series.index.duplicated(keep="last")]
+                grid_index = pd.DatetimeIndex(timestamps)
+
+                ibi_reindexed = (
+                    ibi_series
+                    .reindex(ibi_series.index.union(grid_index))
+                    .ffill()
+                    .reindex(grid_index)
+                )
+                # Back-fill leading NaN: rows before the first beat carry the
+                # first available IBI value rather than being left as NaN.
+                ibi_32 = ibi_reindexed.bfill().values.astype(float)
+            else:
+                # No beats detected in this session — cannot produce meaningful IBI
+                ibi_32 = np.full(n, np.nan)
     else:
         # f07: IBI is derived from the blocked PPG — physically invalid
         ibi_32 = np.full(n, np.nan)
         if not os.path.exists(ibi_path):
             warnings.warn(f"{participant_id}: IBI.csv not found.")
-        if is_s02:
-            warnings.warn(
-                f"S02 IBI: session-start timestamp in IBI.csv start in year 1959 instead of year 2013 like the rest of the files. Setting IBI to NaN"
-            )
 
 
 
@@ -809,6 +834,16 @@ def process_f14() -> pd.DataFrame:
     """
     folder_b = os.path.join(STRESS_DIR, "f14_b")
 
+    # f14_a contained only the Baseline phase but had no button presses, so
+    # phase boundaries cannot be established from it.  It is discarded entirely.
+    # This means f14's Baseline data is permanently unavailable.
+    warnings.warn(
+        "f14: Baseline phase data is unavailable. "
+        "f14_a (which contained the Baseline recording) has no button presses "
+        "and cannot be phase-labelled, so it is discarded. "
+        "Only f14_b (the remainder of the protocol) is used."
+    )
+
     wide_df = _signals_to_wide(folder_b, "f14_b", is_s02=False, is_f07=False)
 
     if wide_df.empty:
@@ -867,7 +902,8 @@ def assign_reported_stress(
     """
     Add a 'reported_stress' column to a wide 32 Hz DataFrame.
 
-    Placement rule (applied per participant × phase, skipping Transition phases):
+    Placement rule (applied per participant × phase, skipping Transition,
+    Pre-protocol and Post-protocol phases):
 
       1. Always place the stress score at the very last timestamp of the phase.
       2. Step backward in 30-second intervals: place the score at
@@ -879,6 +915,8 @@ def assign_reported_stress(
     At 32 Hz, 30 seconds = exactly 960 rows.  Backward steps are therefore
     taken as row-index offsets of 960 rather than floating-point timestamp
     arithmetic, which avoids any sub-millisecond rounding issues.
+    Timestamps are pre-extracted as a NumPy array per group to avoid repeated
+    pandas `.iloc` overhead inside the stepping loop.
 
     Parameters
     ----------
@@ -887,16 +925,13 @@ def assign_reported_stress(
 
     Returns
     -------
-    pd.DataFrame — same as input with 'reported_stress' and 'weight' columns
-    appended.  'reported_stress' is NaN for Transition phases, for rows outside
-    the placement grid, and for any participant/phase pair not found in
-    stress_lut.  'weight' = 1 / (number of scored rows in that phase) at every
-    scored row, NaN elsewhere — ensures weights sum to 1.0 within each phase.
+    pd.DataFrame — same as input with 'reported_stress' column appended.
+    NaN for skipped phases, for rows outside the placement grid, and for any
+    participant/phase pair not found in stress_lut.
     """
-    STEP_ROWS   = 30 * 32          # 960 rows = 30 s at 32 Hz
-    MIN_SECS    = 30.0             # minimum seconds from phase start to place a score
+    STEP_ROWS = 30 * 32    # 960 rows = 30 s at 32 Hz
+    MIN_SECS  = 30.0       # minimum seconds from phase start to place a score
 
-    # Initialise the column as all-NaN float
     df = df.copy()
     df["reported_stress"] = np.nan
 
@@ -906,65 +941,79 @@ def assign_reported_stress(
         for row in stress_lut.itertuples(index=False)
     }
 
-    # Process each (participant, phase) group independently
     for (pid, phase), grp in df.groupby(
         ["participant_id", "phase"], sort=False, observed=True
     ):
-        # Skip Transition phases — no stress score is recorded for them
-        if isinstance(phase, str) and phase.startswith("Transition"):
-            continue
-        
-        # Skip Pre-protocol and Post-protocol phases - no stress score is recorded for them
-        if isinstance(phase, str) and phase.endswith("protocol"):
+        # Skip phases that carry no stress score
+        if isinstance(phase, str) and (
+            phase.startswith("Transition") or phase.endswith("protocol")
+        ):
             continue
 
         score = score_map.get((pid, phase))
         if score is None or (isinstance(score, float) and np.isnan(score)):
-            # No score available for this participant/phase — leave as NaN
             warnings.warn(f"Reported stress on stage {phase} for {pid} not found.")
             continue
 
-        # Integer row positions within this group (0 = first row of phase)
-        n          = len(grp)
-        phase_start_ts = grp["timestamp"].iloc[0]
+        n = len(grp)
 
-        # Collect row positions (within grp) where the score will be placed.
-        # Position n-1 is always included (last timestamp of the phase).
+        # Pre-extract timestamps as a NumPy array (int64 nanoseconds) so the
+        # backward-stepping loop uses plain array indexing rather than repeated
+        # pandas .iloc calls, which have per-call overhead.
+        ts_ns          = grp["timestamp"].values.astype("int64")  # ns since epoch
+        phase_start_ns = ts_ns[0]
+
         positions = []
-        pos = n - 1                           # start at the last row
+        pos = n - 1
         while pos >= 0:
-            ts = grp["timestamp"].iloc[pos]
-            secs_from_start = (ts - phase_start_ts).total_seconds()
+            secs_from_start = (ts_ns[pos] - phase_start_ns) / 1e9
 
             if pos == n - 1:
                 # Last timestamp: always place regardless of phase duration
                 positions.append(pos)
             elif secs_from_start >= MIN_SECS:
-                # Subsequent backward steps: only if ≥ 30 s from phase start
                 positions.append(pos)
             else:
-                # Too close to the phase start — stop stepping backward
                 break
 
-            pos -= STEP_ROWS                  # step back 30 s (960 rows)
+            pos -= STEP_ROWS
 
-        # Write the score into the main DataFrame at the resolved positions
         target_indices = grp.index[positions]
         df.loc[target_indices, "reported_stress"] = score
 
-    # ── Assign weight column ─────────────────────────────────────────────────
-    # For each (participant, phase) group: weight = 1 / n_scored for every row
-    # that received a stress score, NaN everywhere else.
-    # This ensures that summing weights within a phase always equals 1,
-    # regardless of how many 30-second slots fit in that phase.
+    return df
+
+
+def assign_weight(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a 'weight' column to a wide 32 Hz DataFrame that already has
+    'reported_stress' populated by assign_reported_stress().
+
+    weight = 1 / n_scored_rows  for every row that carries a stress score,
+    NaN everywhere else.  This ensures that weights sum to exactly 1.0 within
+    each (participant_id, phase) group, regardless of how many 30-second
+    placement slots that phase contains.
+
+    Kept as a separate function from assign_reported_stress so that callers
+    who do not need weights can skip this step entirely.
+
+    Parameters
+    ----------
+    df : wide DataFrame with a 'reported_stress' column already populated
+
+    Returns
+    -------
+    pd.DataFrame — same as input with 'weight' column appended.
+    """
+    df = df.copy()
     df["weight"] = np.nan
+
     scored_mask = df["reported_stress"].notna()
     if scored_mask.any():
-        # Count scored rows per (participant_id, phase) group
         counts = (
             df[scored_mask]
             .groupby(["participant_id", "phase"], observed=True)
-            .transform("count")["reported_stress"]   # same index as df[scored_mask]
+            .transform("count")["reported_stress"]
         )
         df.loc[scored_mask, "weight"] = 1.0 / counts
 
@@ -1068,10 +1117,12 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame]:
         .reset_index(drop=True)
     )
 
-    # ── Assign self-reported stress scores ───────────────────────────────────
+    # ── Assign self-reported stress scores and weights ───────────────────────
     print("\nAssigning reported stress scores …")
     df_v1 = assign_reported_stress(df_v1, sl_v1)
     df_v2 = assign_reported_stress(df_v2, sl_v2)
+    df_v1 = assign_weight(df_v1)
+    df_v2 = assign_weight(df_v2)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     signal_cols = ["ACC_x", "ACC_y", "ACC_z", "BVP", "EDA", "TEMP", "HR", "IBI"]

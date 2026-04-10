@@ -74,7 +74,7 @@ TEST_CSV  = "merged_df2.csv"
 SIGNALS = ["EDA", "HR", "BVP", "TEMP", "ACC_x", "ACC_y", "ACC_z"]
 
 STRESS_PHASES  = ["TMCT", "Stroop", "Subtract", "Opposite Opinion", "Real Opinion"]
-REST_PHASES    = ["Baseline", "First Rest", "Second Rest"]
+REST_PHASES    = ["Baseline", "First Rest", "Second Rest", "Pre-protocol", "Post-protocol"]
 EXCLUDE_PHASES = ["Transition_1", "Transition_2", "Transition_3"]
 
 MIN_STEPS        = 20

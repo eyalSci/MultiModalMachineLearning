@@ -1,4 +1,5 @@
 """
+granger_phases.py
 =================
 Phase-wise Granger causality between continuous physiological signals.
 
@@ -30,6 +31,7 @@ GRANGER TEST USED:
   lag = [1] (1 second at 1 Hz — we downsample to 1 Hz for speed)
   p < 0.05 = significant causality
 
+
 Train on V1 (merged_df1.csv) only — V2 used as replication check.
 """
 
@@ -58,8 +60,12 @@ LAG         = 1
 MIN_ROWS    = 60   # 60 seconds minimum
 
 # Phases to compare — stress phases vs rest phases
-STRESS_PHASES  = ["TMCT", "Stroop", "Subtract", "Opposite Opinion", "Real Opinion"]
-REST_PHASES    = ["Baseline", "First Rest", "Second Rest"]
+STRESS_PHASES = ["TMCT", "Stroop", "Subtract", "Opposite Opinion", "Real Opinion"]
+
+# UPDATED: Pre-protocol and Post-protocol added as suggested by Eyal
+# These phases have no stress induction so they count as non-stress data
+REST_PHASES   = ["Baseline", "First Rest", "Second Rest",
+                 "Pre-protocol", "Post-protocol"]
 
 # Significance threshold
 ALPHA = 0.05
@@ -160,8 +166,8 @@ def run_analysis(df, dataset_label):
                     "f_stat":      f_stat,
                     "p_value":     p_val,
                     "significant": p_val < ALPHA if not np.isnan(p_val) else False,
-                    "phase_type":  ("stress"   if phase in STRESS_PHASES else
-                                    "rest"     if phase in REST_PHASES   else
+                    "phase_type":  ("stress" if phase in STRESS_PHASES else
+                                    "rest"   if phase in REST_PHASES   else
                                     "other"),
                 })
 

@@ -541,35 +541,40 @@ def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
         pop["stress_vs_rest"] = pop["mean_stress"] - pop["mean_rest"]
         pop = pop.sort_values("stress_vs_rest", ascending=False)
 
-    # v3 fix #4: FDR correction
-    fdr_rows = []
+    # ── P-Value Calculation (Paired T-Test) ──
+    p_rows = []
     for pair in pid_agg["pair"].unique():
-        s = pid_agg[(pid_agg["pair"]==pair) &
-                    (pid_agg["phase_type"]=="stress")]["granger_score"].values
-        r = pid_agg[(pid_agg["pair"]==pair) &
-                    (pid_agg["phase_type"]=="rest")]["granger_score"].values
-        p = stats.ttest_ind(s, r).pvalue if len(s) >= 2 and len(r) >= 2 else np.nan
-        fdr_rows.append({"pair": pair, "p_raw": p})
+        pair_df = pid_agg[pid_agg["pair"] == pair]
+        
+        # Pivot the data to align participants exactly (Rest vs Stress)
+        pivot = pair_df.pivot(index="participant", columns="phase_type", values="granger_score").dropna()
+        
+        # Only run the test if we have at least 2 participants with BOTH Rest and Stress valid scores
+        if len(pivot) >= 2 and "stress" in pivot.columns and "rest" in pivot.columns:
+            s = pivot["stress"].values
+            r = pivot["rest"].values
+            p = stats.ttest_rel(s, r).pvalue  # Using Paired T-Test
+        else:
+            p = np.nan
+            
+        sig = p < ALPHA if not np.isnan(p) else False
+        p_rows.append({"pair": pair, "p_val": p, "sig": sig})
 
-    fdr_df = pd.DataFrame(fdr_rows).dropna(subset=["p_raw"])
-    if len(fdr_df):
-        reject, p_fdr = fdrcorrection(fdr_df["p_raw"].values, alpha=ALPHA)
-        fdr_df = fdr_df.assign(p_fdr=p_fdr, sig_fdr=reject).set_index("pair")
-        pop    = pop.merge(fdr_df[["p_raw","p_fdr","sig_fdr"]],
-                           left_index=True, right_index=True, how="left")
+    p_df = pd.DataFrame(p_rows).set_index("pair")
+    pop = pop.merge(p_df, left_index=True, right_index=True, how="left")
 
-    # Table 1: Granger scores with FDR
+    # Table 1: Granger scores with Raw P-Values
     print("\n  Granger score = MSE(restricted) − MSE(unrestricted)")
-    print("  Participant-level means; BH-FDR corrected p-values\n")
+    print("  Participant-level means; Raw (uncorrected) Paired T-Test p-values\n")
     print(f"  {'Pair':<20} {'Rest':>10}  {'Stress':>10}  "
-          f"{'Δ(S−R)':>10}  {'p_fdr':>8}  sig")
+          f"{'Δ(S−R)':>10}  {'p_val':>8}  sig")
     print(f"  {'─'*20} {'─'*10}  {'─'*10}  {'─'*10}  {'─'*8}  {'─'*3}")
     for pair, row in pop.iterrows():
         r   = row.get("mean_rest",      np.nan)
         s   = row.get("mean_stress",    np.nan)
         d   = row.get("stress_vs_rest", np.nan)
-        p   = row.get("p_fdr",          np.nan)
-        sig = "✓" if row.get("sig_fdr", False) else ""
+        p   = row.get("p_val",          np.nan)
+        sig = "✓" if row.get("sig", False) else ""
         r_s = f"{r:.4f}" if not np.isnan(r) else "     —"
         s_s = f"{s:.4f}" if not np.isnan(s) else "     —"
         d_s = (f"+{d:.4f}" if d > 0 else f"{d:.4f}") if not np.isnan(d) else "     —"
@@ -590,14 +595,14 @@ def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
               f"{row.get('stress',0):>8.0%}")
 
     # Key findings
-    print("\n  FDR-significant pairs with stronger causality under stress:")
-    if "sig_fdr" in pop.columns:
-        top = pop[pop["sig_fdr"] & (pop.get("stress_vs_rest", pd.Series(dtype=float)) > 0)]
+    print(f"\n  Significant pairs with stronger causality under stress (p < {ALPHA}):")
+    if "sig" in pop.columns:
+        top = pop[pop["sig"] & (pop.get("stress_vs_rest", pd.Series(dtype=float)) > 0)]
         if top.empty:
             print("    None.")
         for pair, row in top.iterrows():
             print(f"    {pair:<22} Δ={row['stress_vs_rest']:.4f}  "
-                  f"p_fdr={row['p_fdr']:.4f}")
+                  f"p_val={row['p_val']:.4f}")
 
     # Per-phase breakdown for top 3
     top3 = pop.head(3).index.tolist()

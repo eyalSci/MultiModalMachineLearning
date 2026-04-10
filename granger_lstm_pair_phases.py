@@ -351,7 +351,8 @@ def run_inference(
             if inp.dim() == 1:
                 inp = inp.unsqueeze(1)
             inp    = inp.unsqueeze(0)           # (1, T, input_dim)
-            y_true = seg[sig_y]                 # raw unscaled array
+            
+            y_true_scaled = seg["y_scaled"]     
             T      = inp.shape[1]
 
             h, c  = model.init_state()
@@ -363,14 +364,11 @@ def run_inference(
                 x_chunk = inp[:, start:end, :]
                 pred_sc, (h, c) = model(x_chunk, (h, c))   # (1, chunk, 1)
 
-                pred_np   = pred_sc.squeeze().cpu().numpy()
-                pred_orig = y_sc.inverse_transform(
-                    pred_np.reshape(-1, 1)
-                ).squeeze()
-                targets   = y_true[start + 1: end + 1]
-                sq_errors.extend((pred_orig - targets) ** 2)
+                pred_np = pred_sc.squeeze().cpu().numpy()
+                targets_scaled = y_true_scaled[start + 1: end + 1]
+                
+                sq_errors.extend((pred_np - targets_scaled) ** 2)
                 start = end
-
             results.append({
                 "participant": seg["participant"],
                 "phase":       seg["phase"],

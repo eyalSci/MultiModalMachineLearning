@@ -1,3 +1,132 @@
+"""
+Granger Causality Network Analysis
+==================================
+
+PURPOSE
+-------
+Builds directed physiological interaction networks from the multilag Granger
+results and compares network structure across rest and stress conditions.
+
+Instead of looking only at individual signal pairs (e.g. TEMP -> HR), this
+script summarizes the full causal interaction pattern as a graph:
+    - nodes  = physiological signals
+    - edges  = directed Granger-causal relationships
+    - edge weight = causality strength (F-statistic or stress-rest increase)
+
+This makes it possible to study not only which individual pairs are important,
+but also how the overall physiological system reorganizes under stress.
+
+WHAT THIS DOES
+--------------
+For each dataset (V1 and V2):
+    1. Load pairwise multilag Granger results
+    2. Aggregate results by signal pair
+    3. Compute:
+         - mean causality strength during rest
+         - mean causality strength during stress
+         - stress-rest difference (delta)
+         - significance rate in rest and stress
+         - average selected lag in rest and stress
+    4. Construct three directed networks:
+         - Rest network
+         - Stress network
+         - Stronger-under-stress network (delta network)
+    5. Compute network-level summaries:
+         - number of edges
+         - density
+         - hub signals
+         - in-degree / out-degree / strength
+    6. Compare V1 and V2 to identify replicated stronger-under-stress patterns
+
+KEY IDEAS
+---------
+1.  PAIRWISE RESULTS → SYSTEM-LEVEL VIEW
+    Earlier Granger analysis identified important directed pairs such as
+    TEMP -> HR or IBI -> HR. This script lifts those pairwise results into a
+    network representation so the entire interaction structure can be studied.
+
+2.  THREE NETWORK TYPES
+    Rest network:
+        shows causal structure during non-stress phases
+    Stress network:
+        shows causal structure during stress phases
+    Delta network:
+        shows only edges that become stronger under stress
+
+3.  EDGE FILTERING
+    To avoid clutter, only edges with enough evidence are retained:
+        - minimum stress-rest increase in F-statistic
+        - minimum significance rate during stress
+
+4.  HUB ANALYSIS
+    Signals are ranked by:
+        - in-degree      : how many signals influence them
+        - out-degree     : how many signals they influence
+        - total_strength : total incoming + outgoing edge weight
+    This helps identify central physiological drivers under stress.
+
+5.  CROSS-DATASET REPLICATION
+    V1 and V2 contain different participants, so comparison is done at the
+    pattern level, not participant level. If the same edges become stronger
+    under stress in both datasets, this supports generalization.
+
+MAIN OUTPUTS
+------------
+For each dataset:
+    - pair summary CSV
+    - network metrics CSVs
+    - rest network plot
+    - stress network plot
+    - stronger-under-stress network plot
+
+Across datasets:
+    - V1 vs V2 pattern comparison CSV
+
+INTERPRETATION
+--------------
+This script supports questions such as:
+    - Which causal pathways become stronger under stress?
+    - Which physiological signals become hubs under stress?
+    - Does stress make the interaction network denser or more selective?
+    - Do the same stress-related causal patterns replicate across datasets?
+
+TYPICAL FINDINGS
+----------------
+Examples of interpretable outputs:
+    - TEMP -> HR becomes stronger under stress
+    - IBI -> HR becomes a dominant pathway
+    - ACC axes show stronger coupling under stress
+    - The stress network becomes more structured and directional than rest
+
+CONFIGURATION
+-------------
+Input files:
+    V1_FILE = "granger_results_v1_multilag.csv"
+    V2_FILE = "granger_results_v2_multilag.csv"
+
+Main filtering thresholds:
+    MIN_DELTA_F
+    MIN_STRESS_SIG_RATE
+
+These thresholds control how strict the network construction is.
+
+USAGE
+-----
+Run directly:
+    python granger_network_analysis.py
+
+Generated outputs are saved in:
+    granger_network_outputs/
+
+NOTES
+-----
+This script does not run Granger causality itself.
+It assumes pairwise multilag Granger results have already been computed and
+saved to CSV files.
+
+In other words:
+    pairwise Granger analysis  ->  this script builds the network summary
+"""
 import os
 import numpy as np
 import pandas as pd

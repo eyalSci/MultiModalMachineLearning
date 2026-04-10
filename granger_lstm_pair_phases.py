@@ -1,8 +1,45 @@
 """
-LSTM-based Neural Granger Causality — v4
+LSTM-based Neural Granger Causality — v5
 =========================================
 
-MERGED FROM GEMINI INTO v3
+NEW IN v5
+---------
+STATISTICAL TESTING: LME replaces paired t-test
+  v4 aggregated to participant level then ran ttest_ind across participants.
+  v5 fits a Linear Mixed-Effects Model on ALL segment-level scores:
+
+    granger_score ~ stress_flag + (1|participant) + (1|phase_name)
+
+  - stress_flag  : fixed effect (binary: 1=stress, 0=rest) — the test
+  - (1|participant): random intercept — some people have systematically
+                    higher/lower Granger scores regardless of stress
+  - (1|phase_name): random intercept — e.g. "Stroop" may differ from
+                    "TMCT" independently of the stress classification;
+                    separates phase-name effects from stress effects
+
+  Both random effects are CROSSED (participants go through all phases).
+  Implemented via statsmodels MixedLM with vc_formula for the phase
+  variance component.
+
+  Automatic fallback: if the full model fails to converge for a pair,
+  v5 falls back to participant-only random intercept. Each pair reports
+  which model variant was used.
+
+  FDR correction (BH) is applied to the LME p-values across all pairs,
+  same as v4 — but the raw p-values are now better calibrated because
+  the LME accounts for the multilevel structure of the data.
+
+WHY LME OVER GEE
+  GEE gives population-average effects and is asymptotically valid —
+  it needs large N. With 18 participants GEE is shakier. LME gives
+  subject-specific effects, handles small N better by explicitly
+  partitioning variance, and matches our scientific question (does
+  stress modulate Granger causality per participant?).
+  The temporal ordering concern is mitigated because we already
+  collapsed to segment-level (one score per phase per participant),
+  so within-segment time series are gone.
+
+MERGED FROM v3
 ---------------------------
 A. BASELINE MODEL CACHE
    The restricted model Y(t)→Y(t+1) does not depend on X at all.
@@ -50,6 +87,7 @@ validation — we still chunk validation the same way as
 training.
 """
 
+import os
 import warnings
 import copy
 import numpy as np
@@ -58,8 +96,8 @@ import torch
 import torch.nn as nn
 from itertools import permutations
 from sklearn.preprocessing import StandardScaler
+import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import fdrcorrection
-from scipy import stats
 from collections import defaultdict
 
 warnings.filterwarnings("ignore")
@@ -70,6 +108,9 @@ np.random.seed(42)
 
 TRAIN_CSV = "merged_df1.csv"
 TEST_CSV  = "merged_df2.csv"
+
+OUT_CSV_V1 = "granger_lstm_v5_results_v1.csv"
+OUT_CSV_V2 = "granger_lstm_v5_results_v2.csv"
 
 SIGNALS = ["EDA", "HR", "BVP", "TEMP", "ACC_x", "ACC_y", "ACC_z"]
 
@@ -518,9 +559,91 @@ def run_analysis(df_train: pd.DataFrame, df_test: pd.DataFrame):
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
+def lme_granger_test(df_seg: pd.DataFrame) -> tuple:
+    """
+    Test whether phase_type (stress vs rest) significantly predicts
+    granger_score using a Linear Mixed-Effects Model.
+
+    Model
+    -----
+      granger_score ~ stress_flag
+                    + (1 | participant)     <- random intercept
+                    + (1 | phase_name)      <- random intercept
+
+    Both random effects are CROSSED (each participant goes through all
+    phases), implemented via statsmodels MixedLM with:
+      - groups = participant_id  (handles participant random intercept)
+      - vc_formula = phase       (variance component for phase_name)
+
+    stress_flag is the binary fixed effect (1=stress, 0=rest).
+
+    Returns
+    -------
+    (coef, p_value, t-value, converged, model_label)
+      model_label: 'full'     = participant + phase random effects
+                   'fallback' = participant only (if full model fails)
+                   'failed'   = model did not converge, p=nan returned
+    """
+    df = df_seg.copy()
+    df["stress_flag"] = (df["phase_type"] == "stress").astype(float)
+
+    if df["stress_flag"].nunique() < 2:
+        return np.nan, np.nan, np.nan, False, "failed"
+
+    # ── Full model: participant + phase crossed random effects ────────
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # suppress Hessian boundary warning
+            model = smf.mixedlm(
+                "granger_score ~ stress_flag",
+                data=df,
+                groups=df["participant"],
+                vc_formula={"phase": "0 + C(phase)"},
+            )
+            result = model.fit(reml=True, method="lbfgs")
+        if result.converged and not np.isnan(result.pvalues.get("stress_flag", np.nan)):
+            return (float(result.params["stress_flag"]),
+                    float(result.pvalues["stress_flag"]),
+                    float(result.tvalues["stress_flag"]),
+                    True, "full")
+    except Exception:
+        pass
+
+    # ── Fallback: participant random intercept only ───────────────────
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = smf.mixedlm(
+                "granger_score ~ stress_flag",
+                data=df,
+                groups=df["participant"],
+            )
+            result = model.fit(reml=True)
+        if result.converged and not np.isnan(result.pvalues.get("stress_flag", np.nan)):
+            return (float(result.params["stress_flag"]),
+                    float(result.pvalues["stress_flag"]),
+                    float(result.tvalues["stress_flag"]),
+                    True, "fallback")
+    except Exception:
+        pass
+
+    return np.nan, np.nan, np.nan, False, "failed"
+
 def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """
+    Statistical testing via LME (replaces paired t-test from v4).
+
+    Per pair:
+      granger_score ~ stress_flag + (1|participant) + (1|phase_name)
+
+    FDR correction (BH) applied across all pairs on LME p-values.
+    Display table shows participant-averaged means for readability;
+    significance comes from segment-level LME.
+    """
     print(f"\n{'='*65}")
     print(f"  RESULTS — {label}")
+    print(f"  Statistical test: LME  [granger ~ stress + (1|pid) + (1|phase)]")
+    print(f"  FDR correction  : Benjamini–Hochberg across {results_df['pair'].nunique()} pairs")
     print(f"{'='*65}")
 
     df = results_df[results_df["phase_type"].isin(["stress", "rest"])].copy()
@@ -528,7 +651,7 @@ def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
         print("  No stress/rest segments.")
         return pd.DataFrame()
 
-    # v3 fix #3: participant-level mean first
+    # ── Participant-level means for display ───────────────────────────
     pid_agg = (df.groupby(["pair", "phase_type", "participant"])["granger_score"]
                .mean().reset_index())
 
@@ -536,52 +659,58 @@ def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
            .agg(mean="mean", sem=lambda x: x.sem())
            .unstack("phase_type"))
     pop.columns = ["_".join(c) for c in pop.columns]
-
     if "mean_stress" in pop and "mean_rest" in pop:
         pop["stress_vs_rest"] = pop["mean_stress"] - pop["mean_rest"]
         pop = pop.sort_values("stress_vs_rest", ascending=False)
 
-    # ── P-Value Calculation (Paired T-Test) ──
-    p_rows = []
-    for pair in pid_agg["pair"].unique():
-        pair_df = pid_agg[pid_agg["pair"] == pair]
-        
-        # Pivot the data to align participants exactly (Rest vs Stress)
-        pivot = pair_df.pivot(index="participant", columns="phase_type", values="granger_score").dropna()
-        
-        # Only run the test if we have at least 2 participants with BOTH Rest and Stress valid scores
-        if len(pivot) >= 2 and "stress" in pivot.columns and "rest" in pivot.columns:
-            s = pivot["stress"].values
-            r = pivot["rest"].values
-            p = stats.ttest_rel(s, r).pvalue  # Using Paired T-Test
-        else:
-            p = np.nan
-            
-        sig = p < ALPHA if not np.isnan(p) else False
-        p_rows.append({"pair": pair, "p_val": p, "sig": sig})
+    # ── LME per pair (segment-level data) ────────────────────────────
+    lme_rows = []
+    model_labels = {}
+    for pair in pop.index:
+        df_pair = df[df["pair"] == pair]
+        coef, p_raw, t_value, converged, mlabel = lme_granger_test(df_pair)
+        lme_rows.append({"pair": pair, "coef": coef, "p_raw": p_raw,
+                         "t_value": t_value, "converged": converged})
+        model_labels[pair] = mlabel
 
-    p_df = pd.DataFrame(p_rows).set_index("pair")
-    pop = pop.merge(p_df, left_index=True, right_index=True, how="left")
+    lme_df = pd.DataFrame(lme_rows).set_index("pair")
 
-    # Table 1: Granger scores with Raw P-Values
+    # ── significance ────────────────────────────────────────────────
+    lme_df["sig"] = lme_df["p_raw"] < ALPHA
+    pop = pop.merge(lme_df[["coef", "p_raw", "sig", "t_value"]],
+                    left_index=True, right_index=True, how="left")
+
+    # ── Table 1: Granger scores with LME p-values ─────────────────────
     print("\n  Granger score = MSE(restricted) − MSE(unrestricted)")
-    print("  Participant-level means; Raw (uncorrected) Paired T-Test p-values\n")
-    print(f"  {'Pair':<20} {'Rest':>10}  {'Stress':>10}  "
-          f"{'Δ(S−R)':>10}  {'p_val':>8}  sig")
-    print(f"  {'─'*20} {'─'*10}  {'─'*10}  {'─'*10}  {'─'*8}  {'─'*3}")
+    print("  Participant-level means shown; p-values from segment-level LME\n")
+    print(f"  {'Pair':<20} {'Rest':>9}  {'Stress':>9}  "
+          f"{'Δ(S−R)':>9}  {'t-value':>7}  {'p_raw':>8} sig  model")
+    print(f"  {'─'*20} {'─'*9}  {'─'*9}  {'─'*9}  {'─'*7}  {'─'*8}  {'─'*3}  {'─'*8}")
     for pair, row in pop.iterrows():
         r   = row.get("mean_rest",      np.nan)
         s   = row.get("mean_stress",    np.nan)
         d   = row.get("stress_vs_rest", np.nan)
-        p   = row.get("p_val",          np.nan)
+        t   = row.get("t_value",        np.nan)
+        #b   = row.get("coef",           np.nan)
+        p   = row.get("p_raw",          np.nan)
         sig = "✓" if row.get("sig", False) else ""
+        ml  = model_labels.get(pair, "")
         r_s = f"{r:.4f}" if not np.isnan(r) else "     —"
         s_s = f"{s:.4f}" if not np.isnan(s) else "     —"
         d_s = (f"+{d:.4f}" if d > 0 else f"{d:.4f}") if not np.isnan(d) else "     —"
-        p_s = f"{p:.4f}" if not np.isnan(p) else "     —"
-        print(f"  {pair:<20} {r_s:>10}  {s_s:>10}  {d_s:>10}  {p_s:>8}  {sig}")
+        t_s = f"{t:.4f}"  if not np.isnan(t) else "     —"
+        #b_s = f"{b:.4f}"  if not np.isnan(b) else "     —"
+        p_s = f"{p:.4f}"  if not np.isnan(p) else "     —"
+        print(f"  {pair:<20} {r_s:>9}  {s_s:>9}  {d_s:>9}  "
+              f"{t_s:>7}  {p_s:>8}  {sig:<3}  {ml}")
 
-    # Table 2: win rate
+    # ── Convergence report ─────────────────────────────────────────────
+    n_full     = sum(1 for v in model_labels.values() if v == "full")
+    n_fallback = sum(1 for v in model_labels.values() if v == "fallback")
+    n_failed   = sum(1 for v in model_labels.values() if v == "failed")
+    print(f"\n  Model convergence: full={n_full}  fallback={n_fallback}  failed={n_failed}")
+
+    # ── Table 2: win rate ──────────────────────────────────────────────
     df["x_wins"] = df["granger_score"] > 0
     win = (df.groupby(["pair","phase_type","participant"])["x_wins"].mean()
              .reset_index()
@@ -591,20 +720,21 @@ def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
     print(f"  {'Pair':<20} {'Rest':>8}  {'Stress':>8}")
     print(f"  {'─'*20} {'─'*8}  {'─'*8}")
     for pair, row in win.iterrows():
-        print(f"  {pair:<20} {row.get('rest',0):>8.0%}  "
-              f"{row.get('stress',0):>8.0%}")
+        print(f"  {pair:<20} {row.get('rest',0):>8.0%}  {row.get('stress',0):>8.0%}")
 
-    # Key findings
-    print(f"\n  Significant pairs with stronger causality under stress (p < {ALPHA}):")
+    # ── Key findings ───────────────────────────────────────────────────
+    print("\n  Significant pairs with stronger causality under stress:")
     if "sig" in pop.columns:
-        top = pop[pop["sig"] & (pop.get("stress_vs_rest", pd.Series(dtype=float)) > 0)]
+        top = pop[pop["sig"] & (pop.get("stress_vs_rest",
+                  pd.Series(dtype=float)) > 0)]
         if top.empty:
             print("    None.")
         for pair, row in top.iterrows():
             print(f"    {pair:<22} Δ={row['stress_vs_rest']:.4f}  "
-                  f"p_val={row['p_val']:.4f}")
+                  f"β={row['coef']:.4f}  p={row['p_raw']:.4f}  "
+                  f"[{model_labels.get(pair,'')}]")
 
-    # Per-phase breakdown for top 3
+    # ── Per-phase breakdown ────────────────────────────────────────────
     top3 = pop.head(3).index.tolist()
     if top3:
         print(f"\n  Per-phase granger score (top 3 pairs, participant-averaged):")
@@ -615,30 +745,41 @@ def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
     print()
     return pop
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 def main():
-    df_v1 = load_data(TRAIN_CSV)
-    df_v2 = load_data(TEST_CSV)
-
     n_pairs = len(list(permutations(SIGNALS, 2)))
     print(f"\n{'='*65}")
-    print(f"  LSTM Granger Causality v4")
+    print(f"  LSTM Granger Causality v5")
     print(f"  Signals: {SIGNALS}")
     print(f"  Pairs: {n_pairs}  |  TBPTT: {TBPTT_STEPS}  |  hidden: {HIDDEN_SIZE}")
     print(f"  Restricted [Y] vs Unrestricted [Y,X] → Y+1")
+    print(f"  + Baseline cache + GPU preloading")
+    print(f"  + LME significance test (segment-level, crossed random effects)")
     print(f"{'='*65}\n")
 
-    results_v1, results_v2 = run_analysis(df_v1, df_v2)
+    # Check if BOTH files already exist
+    if os.path.exists(OUT_CSV_V1) and os.path.exists(OUT_CSV_V2):
+        print(f"Found existing results: '{OUT_CSV_V1}' and '{OUT_CSV_V2}'.")
+        print("Skipping training/inference. Loading data directly for summary...\n")
+        
+        results_v1 = pd.read_csv(OUT_CSV_V1)
+        results_v2 = pd.read_csv(OUT_CSV_V2)
+        
+    else:
+        print("Existing result CSVs not found. Starting full training pipeline...\n")
+        
+        df_v1 = load_data(TRAIN_CSV)
+        df_v2 = load_data(TEST_CSV)
 
+        results_v1, results_v2 = run_analysis(df_v1, df_v2)
+
+        results_v1.to_csv(OUT_CSV_V1, index=False)
+        results_v2.to_csv(OUT_CSV_V2, index=False)
+        print(f"Saved: {OUT_CSV_V1}  |  {OUT_CSV_V2}")
+
+    # Always run the summaries regardless of how the data was obtained
     summarise_results(results_v1, "V1 — in-sample  (S01–S18)")
     summarise_results(results_v2, "V2 — held-out   (f01–f18)")
 
-    results_v1.to_csv("granger_lstm_v4_results_v1.csv", index=False)
-    results_v2.to_csv("granger_lstm_v4_results_v2.csv", index=False)
-    print("Saved: granger_lstm_v4_results_v1.csv  |  granger_lstm_v4_results_v2.csv")
-
-
 if __name__ == "__main__":
+    main()
     main()

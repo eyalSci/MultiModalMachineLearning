@@ -1,6 +1,16 @@
 """
-LSTM-based Neural Granger Causality — v5
+LSTM-based Neural Granger Causality — v6
 =========================================
+
+NEW IN v6
+---------
+1. Outputs 4 distinct Mean Squared Error (MSE) scores per pair in the summary:
+   - Restricted Model (Rest)
+   - Unrestricted Model (Rest)
+   - Restricted Model (Stress)
+   - Unrestricted Model (Stress)
+2. Automatically saves the final 'summarise_results' table for V2 into a 
+   dedicated CSV file (`summarise_results.csv`).
 
 NEW IN v5
 ---------
@@ -109,8 +119,9 @@ np.random.seed(42)
 TRAIN_CSV = "merged_df1.csv"
 TEST_CSV  = "merged_df2.csv"
 
-OUT_CSV_V1 = "granger_lstm_v5_results_v1.csv"
-OUT_CSV_V2 = "granger_lstm_v5_results_v2.csv"
+OUT_CSV_V1 = "granger_lstm_v6_results_v1.csv"
+OUT_CSV_V2 = "granger_lstm_v6_results_v2.csv"
+SUMMARY_CSV = "granger_lstm_v6_summarize_results.csv"
 
 SIGNALS = ["EDA", "HR", "BVP", "TEMP", "ACC_x", "ACC_y", "ACC_z"]
 
@@ -551,8 +562,7 @@ def run_analysis(df_train: pd.DataFrame, df_test: pd.DataFrame):
     cache_hits = sum(1 for r in records_v1
                      if r.get("used_global_sync") and
                      records_v1.index(r) > 0)  # proxy count
-    print(f"\n  Baseline cache saved "
-          f"~{len(SIGNALS) - 1} restricted model trainings per Y signal.")
+    print(f"\n  Baseline cache saved ~{len(SIGNALS) - 1} restricted model trainings per Y signal.")
 
     return pd.DataFrame(records_v1), pd.DataFrame(records_v2)
 
@@ -589,7 +599,7 @@ def lme_granger_test(df_seg: pd.DataFrame) -> tuple:
 
     if df["stress_flag"].nunique() < 2:
         return np.nan, np.nan, np.nan, False, "failed"
-
+    
     # ── Full model: participant + phase crossed random effects ────────
     try:
         with warnings.catch_warnings():
@@ -602,9 +612,12 @@ def lme_granger_test(df_seg: pd.DataFrame) -> tuple:
             )
             result = model.fit(reml=True, method="lbfgs")
         if result.converged and not np.isnan(result.pvalues.get("stress_flag", np.nan)):
+            t_val = float(result.tvalues["stress_flag"])
+            if abs(t_val) > 20:
+                raise ValueError("Extreme t-value — degenerate Hessian")
             return (float(result.params["stress_flag"]),
                     float(result.pvalues["stress_flag"]),
-                    float(result.tvalues["stress_flag"]),
+                    t_val,
                     True, "full")
     except Exception:
         pass
@@ -636,29 +649,46 @@ def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
     Per pair:
       granger_score ~ stress_flag + (1|participant) + (1|phase_name)
 
-    FDR correction (BH) applied across all pairs on LME p-values.
     Display table shows participant-averaged means for readability;
     significance comes from segment-level LME.
+    
+    Returns DataFrame of the summarization.
     """
-    print(f"\n{'='*65}")
+    print(f"\n{'='*95}")
     print(f"  RESULTS — {label}")
     print(f"  Statistical test: LME  [granger ~ stress + (1|pid) + (1|phase)]")
-    print(f"  FDR correction  : Benjamini–Hochberg across {results_df['pair'].nunique()} pairs")
-    print(f"{'='*65}")
+    print(f"{'='*95}")
 
     df = results_df[results_df["phase_type"].isin(["stress", "rest"])].copy()
+    
+    # Scale scores by 1000 so the LME math can grip them, and outputs are readable
+    df["granger_score"] = df["granger_score"] * 1000
+    df["mse_restricted"] = df["mse_restricted"] * 1000
+    df["mse_unrestricted"] = df["mse_unrestricted"] * 1000
+    
     if df.empty:
         print("  No stress/rest segments.")
         return pd.DataFrame()
 
-    # ── Participant-level means for display ───────────────────────────
-    pid_agg = (df.groupby(["pair", "phase_type", "participant"])["granger_score"]
+    # ── Participant-level means for display (Aggregating Granger & all 4 MSEs) ──
+    pid_agg = (df.groupby(["pair", "phase_type", "participant"])
+               [["granger_score", "mse_restricted", "mse_unrestricted"]]
                .mean().reset_index())
 
-    pop = (pid_agg.groupby(["pair", "phase_type"])["granger_score"]
-           .agg(mean="mean", sem=lambda x: x.sem())
-           .unstack("phase_type"))
-    pop.columns = ["_".join(c) for c in pop.columns]
+    # Build Granger columns
+    pop_granger = pid_agg.groupby(["pair", "phase_type"])["granger_score"].agg(mean="mean", sem=lambda x: x.sem()).unstack("phase_type")
+    pop_granger.columns = ["_".join(c) for c in pop_granger.columns]
+    
+    # Build MSE columns
+    pop_mse_r = pid_agg.groupby(["pair", "phase_type"])["mse_restricted"].mean().unstack("phase_type")
+    pop_mse_r.columns = [f"mse_r_{c}" for c in pop_mse_r.columns]
+
+    pop_mse_u = pid_agg.groupby(["pair", "phase_type"])["mse_unrestricted"].mean().unstack("phase_type")
+    pop_mse_u.columns = [f"mse_u_{c}" for c in pop_mse_u.columns]
+
+    # Combine everything horizontally
+    pop = pd.concat([pop_granger, pop_mse_r, pop_mse_u], axis=1)
+
     if "mean_stress" in pop and "mean_rest" in pop:
         pop["stress_vs_rest"] = pop["mean_stress"] - pop["mean_rest"]
         pop = pop.sort_values("stress_vs_rest", ascending=False)
@@ -680,28 +710,44 @@ def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
     pop = pop.merge(lme_df[["coef", "p_raw", "sig", "t_value"]],
                     left_index=True, right_index=True, how="left")
 
-    # ── Table 1: Granger scores with LME p-values ─────────────────────
+    # ── Table 1: Granger scores with 4 MSEs & LME p-values ──────────────
     print("\n  Granger score = MSE(restricted) − MSE(unrestricted)")
     print("  Participant-level means shown; p-values from segment-level LME\n")
-    print(f"  {'Pair':<20} {'Rest':>9}  {'Stress':>9}  "
-          f"{'Δ(S−R)':>9}  {'t-value':>7}  {'p_raw':>8} sig  model")
-    print(f"  {'─'*20} {'─'*9}  {'─'*9}  {'─'*9}  {'─'*7}  {'─'*8}  {'─'*3}  {'─'*8}")
+    print(f"  {'Pair':<20} {'Rest':>9}  {'Stress':>9}  {'Δ(S−R)':>9}  "
+          f"{'MSE_R(r)':>8} {'MSE_U(r)':>8} {'MSE_R(s)':>8} {'MSE_U(s)':>8}  "
+          f"{'t-value':>7}  {'p_raw':>8} sig  model")
+    print(f"  {'─'*20} {'─'*9}  {'─'*9}  {'─'*9}  "
+          f"{'─'*8} {'─'*8} {'─'*8} {'─'*8}  {'─'*7}  {'─'*8}  {'─'*3}  {'─'*8}")
+    
     for pair, row in pop.iterrows():
         r   = row.get("mean_rest",      np.nan)
         s   = row.get("mean_stress",    np.nan)
         d   = row.get("stress_vs_rest", np.nan)
+        
+        mr_r = row.get("mse_r_rest", np.nan)
+        mu_r = row.get("mse_u_rest", np.nan)
+        mr_s = row.get("mse_r_stress", np.nan)
+        mu_s = row.get("mse_u_stress", np.nan)
+        
         t   = row.get("t_value",        np.nan)
-        #b   = row.get("coef",           np.nan)
         p   = row.get("p_raw",          np.nan)
         sig = "✓" if row.get("sig", False) else ""
         ml  = model_labels.get(pair, "")
-        r_s = f"{r:.4f}" if not np.isnan(r) else "     —"
-        s_s = f"{s:.4f}" if not np.isnan(s) else "     —"
-        d_s = (f"+{d:.4f}" if d > 0 else f"{d:.4f}") if not np.isnan(d) else "     —"
-        t_s = f"{t:.4f}"  if not np.isnan(t) else "     —"
-        #b_s = f"{b:.4f}"  if not np.isnan(b) else "     —"
-        p_s = f"{p:.4f}"  if not np.isnan(p) else "     —"
+        
+        r_s   = f"{r:.4f}" if not np.isnan(r) else "     —"
+        s_s   = f"{s:.4f}" if not np.isnan(s) else "     —"
+        d_s   = (f"+{d:.4f}" if d > 0 else f"{d:.4f}") if not np.isnan(d) else "     —"
+        
+        mrr_s = f"{mr_r:.4f}" if not np.isnan(mr_r) else "       —"
+        mur_s = f"{mu_r:.4f}" if not np.isnan(mu_r) else "       —"
+        mrs_s = f"{mr_s:.4f}" if not np.isnan(mr_s) else "       —"
+        mus_s = f"{mu_s:.4f}" if not np.isnan(mu_s) else "       —"
+        
+        t_s   = f"{t:.4f}"  if not np.isnan(t) else "     —"
+        p_s   = f"{p:.4f}"  if not np.isnan(p) else "     —"
+        
         print(f"  {pair:<20} {r_s:>9}  {s_s:>9}  {d_s:>9}  "
+              f"{mrr_s:>8} {mur_s:>8} {mrs_s:>8} {mus_s:>8}  "
               f"{t_s:>7}  {p_s:>8}  {sig:<3}  {ml}")
 
     # ── Convergence report ─────────────────────────────────────────────
@@ -748,12 +794,12 @@ def summarise_results(results_df: pd.DataFrame, label: str) -> pd.DataFrame:
 def main():
     n_pairs = len(list(permutations(SIGNALS, 2)))
     print(f"\n{'='*65}")
-    print(f"  LSTM Granger Causality v5")
+    print(f"  LSTM Granger Causality v6")
     print(f"  Signals: {SIGNALS}")
     print(f"  Pairs: {n_pairs}  |  TBPTT: {TBPTT_STEPS}  |  hidden: {HIDDEN_SIZE}")
     print(f"  Restricted [Y] vs Unrestricted [Y,X] → Y+1")
-    print(f"  + Baseline cache + GPU preloading")
     print(f"  + LME significance test (segment-level, crossed random effects)")
+    print(f"  + 4 MSE variant outputs integrated to Summary Table")
     print(f"{'='*65}\n")
 
     # Check if BOTH files already exist
@@ -777,9 +823,14 @@ def main():
         print(f"Saved: {OUT_CSV_V1}  |  {OUT_CSV_V2}")
 
     # Always run the summaries regardless of how the data was obtained
-    summarise_results(results_v1, "V1 — in-sample  (S01–S18)")
-    summarise_results(results_v2, "V2 — held-out   (f01–f18)")
+    pop_v1 = summarise_results(results_v1, "V1 — in-sample  (S01–S18)")
+    pop_v2 = summarise_results(results_v2, "V2 — held-out   (f01–f18)")
+
+    # Save ONLY the summary results of V2 to a new CSV file
+    if not pop_v2.empty:
+        pop_v2.reset_index().to_csv(SUMMARY_CSV, index=False)
+        print(f"Saved V2 Summary to: {SUMMARY_CSV}")
+
 
 if __name__ == "__main__":
-    main()
     main()

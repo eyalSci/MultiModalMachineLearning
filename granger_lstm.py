@@ -23,7 +23,7 @@ SEED = 42
 torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
 
 # ── Config ───────────────────────────────────────────────
-DATA_PATH   = 'aggregated_df1_no_windows.csv'
+DATA_PATH   = 'aggregated_df1.csv'
 TARGET      = 'reported_stress'
 
 MAX_EPOCHS  = 300

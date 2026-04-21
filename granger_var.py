@@ -26,7 +26,7 @@ from typing import Optional, Tuple, List, Dict
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
-DATA_PATH    = 'aggregated_df1_no_windows.csv'
+DATA_PATH    = 'aggregated_df1.csv'
 TARGET       = 'reported_stress'
 MAX_LAG      = 1
 NOISE_LEVELS = [0]

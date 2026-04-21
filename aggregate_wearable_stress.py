@@ -749,5 +749,5 @@ if __name__ == "__main__":
                  "reported_stress"]].head())
     print(f"\nTotal columns: {df_v1.shape[1]}  {list(df_v1.columns)}")
 
-    df_v1.to_csv("aggregated_df1_no_windows.csv", index=False)
-    df_v2.to_csv("aggregated_df2_no_windows.csv", index=False)
+    df_v1.to_csv("aggregated_df1.csv", index=False)
+    df_v2.to_csv("aggregated_df2.csv", index=False)
